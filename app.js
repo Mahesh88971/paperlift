@@ -34,6 +34,7 @@ let scriptPromise;
 let copyTimer;
 let toastTimer;
 let workerCache = new Map();
+let activeScanFailure = null;
 
 function announce(message) {
   byId("announcement").textContent = message;
@@ -78,8 +79,21 @@ function setProgress(value, label) {
   stage.style.setProperty("--scan-position", `${3 + value * .94}%`);
 }
 
+function reportOCRProgress({ status: phase, progress }) {
+  if (!busy) return;
+  if (phase === "loading tesseract core") {
+    setProgress(4 + Math.round(progress * 4), "Loading OCR engine");
+  } else if (phase === "loading language traineddata") {
+    setProgress(8 + Math.round(progress * 14), "Loading language model");
+  } else if (phase === "initializing tesseract" || phase === "initializing api") {
+    setProgress(24, "Preparing scanner");
+  } else if (phase === "recognizing text") {
+    setProgress(25 + Math.round(progress * 73), "Reading your page");
+  }
+}
+
 function prepareOCRImage(image) {
-  const maxDimension = 2400;
+  const maxDimension = 2000;
   const scale = Math.min(1, maxDimension / Math.max(image.naturalWidth, image.naturalHeight));
   const canvas = document.createElement("canvas");
   canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
@@ -109,7 +123,30 @@ function loadEngine() {
 }
 
 function preloadEngine() {
-  void loadEngine().catch(() => {});
+  void getWorker("eng").catch(() => {});
+}
+
+function getWorker(selectedLanguage) {
+  let workerPromise = workerCache.get(selectedLanguage);
+  if (!workerPromise) {
+    workerPromise = loadEngine().then(async (tesseract) => {
+      const worker = await tesseract.createWorker(selectedLanguage.split("+"), tesseract.OEM.LSTM_ONLY, {
+        workerPath: new URL("worker.min.js", assets).href,
+        corePath: assets.href.slice(0, -1),
+        langPath: assets.href.slice(0, -1),
+        workerBlobURL: false,
+        errorHandler: (error) => activeScanFailure?.(new Error(String(error))),
+        logger: reportOCRProgress,
+      });
+      await worker.setParameters({ tessedit_pageseg_mode: tesseract.PSM.AUTO });
+      return worker;
+    }).catch((error) => {
+      workerCache.delete(selectedLanguage);
+      throw error;
+    });
+    workerCache.set(selectedLanguage, workerPromise);
+  }
+  return workerPromise;
 }
 
 async function recognize(url, selectedLanguage) {
@@ -120,46 +157,27 @@ async function recognize(url, selectedLanguage) {
     fail = reject;
     timer = setTimeout(() => reject(new Error("Scan timed out")), 90_000);
   });
+  activeScanFailure = fail;
   const job = async () => {
-    const tesseract = await loadEngine();
     if (finished) return;
 
-    let worker = workerCache.get(selectedLanguage);
-    if (!worker) {
-      worker = await tesseract.createWorker(selectedLanguage.split("+"), tesseract.OEM.LSTM_ONLY, {
-        workerPath: new URL("worker.min.js", assets).href,
-        corePath: assets.href.slice(0, -1),
-        langPath: assets.href.slice(0, -1),
-        workerBlobURL: false,
-        errorHandler: (error) => fail(new Error(String(error))),
-      });
-      await worker.setParameters({ tessedit_pageseg_mode: tesseract.PSM.AUTO });
-      workerCache.set(selectedLanguage, worker);
-    }
+    const worker = await getWorker(selectedLanguage);
+    if (finished) return;
 
     const image = new Image();
     image.src = url;
     await image.decode();
     const ocrImage = prepareOCRImage(image);
 
-    const result = await worker.recognize(ocrImage, {}, {
-      logger: ({ status: phase, progress }) => {
-        if (finished) return;
-        if (phase === "recognizing text") {
-          setProgress(25 + Math.round(progress * 73), "Reading your page");
-        } else if (phase === "loading language traineddata") {
-          setProgress(8 + Math.round(progress * 12), "Loading language model");
-        } else if (phase === "initializing api") {
-          setProgress(23, "Preparing scanner");
-        }
-      },
-    });
+    setProgress(25, "Reading your page");
+    const result = await worker.recognize(ocrImage);
     return result.data;
   };
   try {
     return await Promise.race([job(), failure]);
   } finally {
     finished = true;
+    if (activeScanFailure === fail) activeScanFailure = null;
     clearTimeout(timer);
   }
 }
@@ -171,7 +189,7 @@ async function scan() {
   editor.classList.add("processing");
   stage.classList.add("scanning");
   working.hidden = false;
-  setProgress(0, "Preparing scanner");
+  setProgress(0, "Starting OCR engine");
   setStatus("working", "Scanning");
   announce("Scanning the printed page.");
   try {
@@ -195,8 +213,13 @@ async function scan() {
   } catch (error) {
     console.warn("Paperlift scanner:", error);
     setStatus("error", "Scan failed");
-    transcript.placeholder = "Scan failed. Try scanning the page again or upload a new photo.";
-    notify("The scan could not finish. Try scanning the page again.", "error");
+    const message = /timed out/i.test(String(error))
+      ? "OCR took too long. Try a smaller, clearer image and rescan."
+      : /fetch|network/i.test(String(error))
+        ? "OCR files could not load. Check your connection and rescan."
+        : "The scan could not finish. Try a clearer image and rescan.";
+    transcript.placeholder = message;
+    notify(message, "error");
   } finally {
     working.hidden = true;
     stage.classList.remove("scanning");
