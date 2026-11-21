@@ -33,6 +33,7 @@ let cameraRequest = 0;
 let scriptPromise;
 let copyTimer;
 let toastTimer;
+let workerCache = new Map();
 
 function announce(message) {
   byId("announcement").textContent = message;
@@ -77,6 +78,19 @@ function setProgress(value, label) {
   stage.style.setProperty("--scan-position", `${3 + value * .94}%`);
 }
 
+function prepareOCRImage(image) {
+  const maxDimension = 2400;
+  const scale = Math.min(1, maxDimension / Math.max(image.naturalWidth, image.naturalHeight));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+  canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+  const context = canvas.getContext("2d", { alpha: false });
+  context.fillStyle = "#fff";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(image, 0, 0, canvas.width, canvas.height);
+  return canvas;
+}
+
 function loadEngine() {
   if (window.Tesseract) return Promise.resolve(window.Tesseract);
   if (!scriptPromise) {
@@ -94,8 +108,11 @@ function loadEngine() {
   return scriptPromise;
 }
 
+function preloadEngine() {
+  void loadEngine().catch(() => {});
+}
+
 async function recognize(url, selectedLanguage) {
-  let worker;
   let timer;
   let finished = false;
   let fail;
@@ -106,12 +123,26 @@ async function recognize(url, selectedLanguage) {
   const job = async () => {
     const tesseract = await loadEngine();
     if (finished) return;
-    worker = await tesseract.createWorker(selectedLanguage.split("+"), tesseract.OEM.LSTM_ONLY, {
-      workerPath: new URL("worker.min.js", assets).href,
-      corePath: assets.href.slice(0, -1),
-      langPath: assets.href.slice(0, -1),
-      workerBlobURL: false,
-      errorHandler: (error) => fail(new Error(String(error))),
+
+    let worker = workerCache.get(selectedLanguage);
+    if (!worker) {
+      worker = await tesseract.createWorker(selectedLanguage.split("+"), tesseract.OEM.LSTM_ONLY, {
+        workerPath: new URL("worker.min.js", assets).href,
+        corePath: assets.href.slice(0, -1),
+        langPath: assets.href.slice(0, -1),
+        workerBlobURL: false,
+        errorHandler: (error) => fail(new Error(String(error))),
+      });
+      await worker.setParameters({ tessedit_pageseg_mode: tesseract.PSM.AUTO });
+      workerCache.set(selectedLanguage, worker);
+    }
+
+    const image = new Image();
+    image.src = url;
+    await image.decode();
+    const ocrImage = prepareOCRImage(image);
+
+    const result = await worker.recognize(ocrImage, {}, {
       logger: ({ status: phase, progress }) => {
         if (finished) return;
         if (phase === "recognizing text") {
@@ -123,12 +154,6 @@ async function recognize(url, selectedLanguage) {
         }
       },
     });
-    if (finished) {
-      await worker.terminate();
-      return;
-    }
-    await worker.setParameters({ tessedit_pageseg_mode: tesseract.PSM.AUTO });
-    const result = await worker.recognize(url, { rotateAuto: true });
     return result.data;
   };
   try {
@@ -136,7 +161,6 @@ async function recognize(url, selectedLanguage) {
   } finally {
     finished = true;
     clearTimeout(timer);
-    if (worker) await worker.terminate().catch(() => {});
   }
 }
 
@@ -389,3 +413,7 @@ copyButton.addEventListener("click", copyText);
 downloadButton.addEventListener("click", downloadText);
 byId("dismiss-toast").addEventListener("click", () => { toast.hidden = true; });
 refreshOutput();
+window.addEventListener("load", () => {
+  if (window.requestIdleCallback) window.requestIdleCallback(preloadEngine, { timeout: 4000 });
+  else setTimeout(preloadEngine, 800);
+});
